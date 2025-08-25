@@ -36,6 +36,7 @@ import cv2
 import tf_transformations
 from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import PoseArray, Pose
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
@@ -91,6 +92,24 @@ class ArucoNode(rclpy.node.Node):
             ),
         )
 
+        self.declare_parameter(
+            name="publish_debug_image",
+            value=False,
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_BOOL,
+                description="Whether to publish debug image with detected markers.",
+            ),
+        )
+        
+        self.declare_parameter(
+            name="use_compressed_input_image",
+            value=False,
+            descriptor=ParameterDescriptor(
+                type=ParameterType.PARAMETER_BOOL,
+                description="If true, subscribe to CompressedImage and decode.",
+            ),
+        )
+
         self.marker_size = (
             self.get_parameter("marker_size").get_parameter_value().double_value
         )
@@ -114,6 +133,19 @@ class ArucoNode(rclpy.node.Node):
         self.camera_frame = (
             self.get_parameter("camera_frame").get_parameter_value().string_value
         )
+        
+        self.publish_debug_image = (
+            self.get_parameter("publish_debug_image").get_parameter_value().bool_value
+        )
+        self.get_logger().info(f"Publish debug image: {self.publish_debug_image}")
+
+        # Determine if compressed input should be used, based on param or topic suffix
+        self.use_compressed_input = (
+            self.get_parameter("use_compressed_input_image").get_parameter_value().bool_value
+        )
+        if not self.use_compressed_input and image_topic.endswith("/compressed"):
+            self.use_compressed_input = True
+        self.get_logger().info(f"Using compressed image input: {self.use_compressed_input}")
 
         # Make sure we have a valid dictionary id:
         try:
@@ -132,21 +164,29 @@ class ArucoNode(rclpy.node.Node):
             CameraInfo, info_topic, self.info_callback, qos_profile_sensor_data
         )
 
-        self.create_subscription(
-            Image, image_topic, self.image_callback, qos_profile_sensor_data
-        )
+        if self.use_compressed_input:
+            self.create_subscription(
+                CompressedImage, image_topic, self.image_callback_compressed, qos_profile_sensor_data
+            )
+        else:
+            self.create_subscription(
+                Image, image_topic, self.image_callback_raw, qos_profile_sensor_data
+            )
 
         # Set up publishers
         self.poses_pub = self.create_publisher(PoseArray, "aruco_poses", 10)
         self.markers_pub = self.create_publisher(ArucoMarkers, "aruco_markers", 10)
+        
+        if self.publish_debug_image:
+            self.debug_image_pub = self.create_publisher(Image, "aruco_debug_image", 10)
 
         # Set up fields for camera parameters
         self.info_msg = None
         self.intrinsic_mat = None
         self.distortion = None
 
-        self.aruco_dictionary = cv2.aruco.Dictionary_get(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
+        self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+        self.aruco_parameters = cv2.aruco.DetectorParameters()
         self.bridge = CvBridge()
 
     def info_callback(self, info_msg):
@@ -156,12 +196,29 @@ class ArucoNode(rclpy.node.Node):
         # Assume that camera parameters will remain the same...
         self.destroy_subscription(self.info_sub)
 
-    def image_callback(self, img_msg):
+    def image_callback_raw(self, img_msg):
         if self.info_msg is None:
             self.get_logger().warn("No camera info has been received!")
             return
 
         cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
+        self._process_image(cv_image, img_msg.header)
+
+    def image_callback_compressed(self, img_msg):
+        if self.info_msg is None:
+            self.get_logger().warn("No camera info has been received!")
+            return
+
+        # Decode compressed image to BGR then convert to grayscale
+        try:
+            cv_bgr = self.bridge.compressed_imgmsg_to_cv2(img_msg)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to decode compressed image: {e}")
+            return
+        cv_image = cv2.cvtColor(cv_bgr, cv2.COLOR_BGR2GRAY)
+        self._process_image(cv_image, img_msg.header)
+
+    def _process_image(self, cv_image_gray, header):
         markers = ArucoMarkers()
         pose_array = PoseArray()
         if self.camera_frame == "":
@@ -171,11 +228,11 @@ class ArucoNode(rclpy.node.Node):
             markers.header.frame_id = self.camera_frame
             pose_array.header.frame_id = self.camera_frame
 
-        markers.header.stamp = img_msg.header.stamp
-        pose_array.header.stamp = img_msg.header.stamp
+        markers.header.stamp = header.stamp
+        pose_array.header.stamp = header.stamp
 
         corners, marker_ids, rejected = cv2.aruco.detectMarkers(
-            cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
+            cv_image_gray, self.aruco_dictionary, parameters=self.aruco_parameters
         )
         if marker_ids is not None:
             if cv2.__version__ > "4.0.0":
@@ -207,6 +264,40 @@ class ArucoNode(rclpy.node.Node):
 
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
+            
+        # Publish debug image if enabled
+        if self.publish_debug_image:
+            # Convert back to color for visualization
+            debug_image = cv2.cvtColor(cv_image_gray, cv2.COLOR_GRAY2BGR)
+            
+            # Draw detected markers
+            if marker_ids is not None:
+                cv2.aruco.drawDetectedMarkers(debug_image, corners, marker_ids)
+                
+                # Draw coordinate axes for each marker
+                if self.intrinsic_mat is not None and self.distortion is not None:
+                    rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                        corners, self.marker_size, self.intrinsic_mat, self.distortion
+                    )
+                    for i in range(len(marker_ids)):
+                        cv2.drawFrameAxes(debug_image, self.intrinsic_mat, self.distortion, 
+                                        rvecs[i], tvecs[i], self.marker_size * 0.5)
+            
+            # Draw rejected markers in red
+            if len(rejected) > 0:
+                cv2.aruco.drawDetectedMarkers(debug_image, rejected, borderColor=(0, 0, 255))
+            
+            # Add detection info text
+            text = f"Detected: {len(marker_ids) if marker_ids is not None else 0}, Rejected: {len(rejected)}"
+            cv2.putText(debug_image, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Convert and publish debug image
+            try:
+                debug_msg = self.bridge.cv2_to_imgmsg(debug_image, encoding="bgr8")
+                debug_msg.header = header
+                self.debug_image_pub.publish(debug_msg)
+            except Exception as e:
+                self.get_logger().warn(f"Failed to publish debug image: {e}")
 
 
 def main():
